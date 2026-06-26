@@ -1,0 +1,143 @@
+name: Android Release
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and publish, for example v1.2.2
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      JAVA_VERSION: "17"
+      GO_VERSION: "1.26.0"
+      ANDROID_API_LEVEL: "35"
+      ANDROID_BUILD_TOOLS: "35.0.0"
+      ANDROID_NDK_VERSION: "29.0.13846066"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout requested tag
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        run: git checkout "${{ inputs.release_tag }}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go.mod
+            go_client/go.mod
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Prepare signing config
+        shell: bash
+        run: |
+          printf 'sdk.dir=%s\n' "${ANDROID_SDK_ROOT}" > local.properties
+
+          if [[ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+            printf 'KEYSTORE_FILE=%s\n' "$RUNNER_TEMP/release.keystore" >> local.properties
+            printf 'KEYSTORE_PASSWORD=%s\n' "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> local.properties
+            printf 'KEY_ALIAS=%s\n' "${{ secrets.ANDROID_KEY_ALIAS }}" >> local.properties
+            printf 'KEY_PASSWORD=%s\n' "${{ secrets.ANDROID_KEY_PASSWORD }}" >> local.properties
+          else
+            echo "Release keystore secrets are not configured; Gradle will fall back to debug signing."
+          fi
+
+      - name: Build release APKs
+        shell: bash
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
+          ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print -exec cp {} dist/ \;
+          cd dist
+          sha256sum *.apk > SHA256SUMS.txt
+
+          if git describe --tags --exact-match >/dev/null 2>&1; then
+            BUILD_REF="$(git describe --tags --exact-match)"
+          else
+            BUILD_REF="$(git rev-parse --short HEAD)"
+          fi
+
+          {
+            echo "release_ref=$BUILD_REF"
+            echo "artifact_dir=dist"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwdtt-${{ steps.collect.outputs.release_ref }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          BODY_FILE="$RUNNER_TEMP/release-notes.md"
+          cat > "$BODY_FILE" <<EOF
+          CI-built release from \`${RELEASE_TAG}\`.
+
+          Commit: \`$(git rev-parse HEAD)\`
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "qWDTT ${VERSION}" --notes-file "$BODY_FILE"
+          else
+            gh release create "$RELEASE_TAG" --target "$(git rev-parse HEAD)" --title "qWDTT ${VERSION}" --notes-file "$BODY_FILE"
+          fi
+
+          gh release upload "$RELEASE_TAG" dist/* --clobber
